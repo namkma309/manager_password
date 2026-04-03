@@ -7,6 +7,11 @@ __pycache__/
 vault_data.json
 *.json
 
+# Cơ sở dữ liệu lõi hệ thống
+vault.db
+*.db
+*.sqlite
+
 # File logs
 otp_debug.log
 *.log

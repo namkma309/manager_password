@@ -6,8 +6,9 @@ import uuid
 import customtkinter as ctk
 from PIL import Image
 import qrcode
+
 from crypto_py import SecurityManager
-from storage import load_vault, save_vault
+from storage import get_config, set_config, get_all_entries, add_entry, delete_entry
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -21,17 +22,18 @@ class AuraVaultApp(ctk.CTk):
 
         self.aes_key = None
         self.vault_data = [] 
-        self.config_data = load_vault()
         
         self.editing_id = None
         self.pass_visible_state = {}
         self.pass_labels = {}
         self.toggle_btns = {}
 
-        if not self.config_data:
+        # Nếu chưa có cấu hình trên SQLite -> Setup. Nếu có -> form Đăng nhập Đa cổng.
+        saved_totp = get_config("totp_secret")
+        if not saved_totp:
             self.show_setup_master_frame()
         else:
-            self.show_login_otp_frame()
+            self.show_login_frame()
 
     # ========================== GIAI ĐOẠN SETUP 1 ==========================
     def show_setup_master_frame(self):
@@ -60,6 +62,8 @@ class AuraVaultApp(ctk.CTk):
             self.err_lbl_1.configure(text="Lỗi Giao Thức: Vui lòng cung cấp Mật khẩu chính trước khi tiếp tục.")
             return
 
+        # Tính toán thông số PBKDF2 dựa trên hàm băm SHA
+        self.temp_pass_signature = SecurityManager.hash_data(master_password)  # Băm đối chiếu
         self.temp_salt = SecurityManager.generate_salt()
         self.temp_aes_key = SecurityManager.derive_key(master_password, self.temp_salt)
         
@@ -106,49 +110,83 @@ class AuraVaultApp(ctk.CTk):
 
         self.aes_key = self.temp_aes_key
         
-        self.config_data = {
-            "salt": base64.b64encode(self.temp_salt).decode('utf-8'),
-            "totp_secret": self.temp_totp_secret,
-            "app_aes_key": base64.b64encode(self.aes_key).decode('utf-8'),
-            "entries": []
-        }
-        save_vault(self.config_data)
+        # SQL Insert cấu hình lõi
+        set_config("signature", self.temp_pass_signature) 
+        set_config("salt", base64.b64encode(self.temp_salt).decode('utf-8'))
+        set_config("totp_secret", self.temp_totp_secret)
+        set_config("app_aes_key", base64.b64encode(self.aes_key).decode('utf-8'))
 
         self.show_vault_frame()
 
-    # ========================== ĐĂNG NHẬP ==========================
-    def show_login_otp_frame(self):
+    # ========================== ĐĂNG NHẬP ĐA CỔNG (OTP & MASTER PASS) ==========================
+    def show_login_frame(self):
         for widget in self.winfo_children():
             widget.destroy()
 
         frame = ctk.CTkFrame(self, fg_color="transparent")
-        frame.pack(fill="both", expand=True, padx=40, pady=60)
+        frame.pack(fill="both", expand=True, padx=40, pady=50)
 
-        ctk.CTkLabel(frame, text="Manager Password", font=("Outfit", 34, "bold"), text_color="#8b5cf6").pack(pady=(20, 5))
-        ctk.CTkLabel(frame, text="Yêu cầu xác thực bảo mật: Vui lòng cung cấp mã(TOTP) để truy cập hệ thống", font=("Outfit", 14)).pack(pady=(0, 30))
+        ctk.CTkLabel(frame, text="Manager Password", font=("Outfit", 34, "bold"), text_color="#8b5cf6").pack(pady=(10, 5))
+        ctk.CTkLabel(frame, text="Yêu cầu xác thực bảo mật: Lựa chọn 1 trong 2 phương thức để mở Két", font=("Outfit", 14)).pack(pady=(0, 20))
 
-        self.otp_entry = ctk.CTkEntry(frame, placeholder_text="Mã TOTP", width=220, height=50, corner_radius=12, font=("Outfit", 24, "bold"), justify="center")
+        self.login_tabs = ctk.CTkTabview(frame, width=320, height=220, corner_radius=12)
+        self.login_tabs.pack(pady=10)
+
+        # Tab 1: OTP
+        self.login_tabs.add("Mã Smart OTP")
+        self.otp_entry = ctk.CTkEntry(self.login_tabs.tab("Mã Smart OTP"), placeholder_text="Mã TOTP", width=220, height=45, corner_radius=8, font=("Outfit", 20, "bold"), justify="center")
         self.otp_entry.pack(pady=20)
-        self.otp_entry.bind("<Return>", lambda event: self.handle_login())
+        self.otp_entry.bind("<Return>", lambda event: self.handle_login_otp())
+        ctk.CTkButton(self.login_tabs.tab("Mã Smart OTP"), text="Xác Thực OTP", width=220, height=40, corner_radius=8, fg_color="#f59e0b", font=("Outfit", 14, "bold"), command=self.handle_login_otp).pack()
 
-        btn = ctk.CTkButton(frame, text="Truy Cập Hệ Thống Lõi", width=220, height=45, corner_radius=12, fg_color="#7c3aed", font=("Outfit", 15, "bold"), command=self.handle_login)
-        btn.pack(pady=10)
+        # Tab 2: Master Password
+        self.login_tabs.add("Khóa Master Pass")
+        self.pass_entry_login = ctk.CTkEntry(self.login_tabs.tab("Khóa Master Pass"), placeholder_text="Nhập Master Password", show="*", width=220, height=45, corner_radius=8)
+        self.pass_entry_login.pack(pady=20)
+        self.pass_entry_login.bind("<Return>", lambda event: self.handle_login_master())
+        ctk.CTkButton(self.login_tabs.tab("Khóa Master Pass"), text="Xác Thực Mật Khẩu", width=220, height=40, corner_radius=8, fg_color="#3b82f6", font=("Outfit", 14, "bold"), command=self.handle_login_master).pack()
 
         self.error_label = ctk.CTkLabel(frame, text="", text_color="#ef4444", font=("Outfit", 13))
-        self.error_label.pack(pady=5)
+        self.error_label.pack(pady=10)
 
-    def handle_login(self):
+    def handle_login_otp(self):
         code = self.otp_entry.get().strip()
-        saved_secret = self.config_data.get("totp_secret")
+        saved_secret = get_config("totp_secret")
         
         if not SecurityManager.verify_totp(saved_secret, code):
             self.error_label.configure(text="Lỗi Giao Thức Ủy Quyền: Mã TOTP cung cấp không hợp lệ.")
             return
             
-        self.aes_key = base64.b64decode(self.config_data["app_aes_key"])
+        self.aes_key = base64.b64decode(get_config("app_aes_key"))
+        self.load_vault_datastore()
+
+    def handle_login_master(self):
+        master_password = self.pass_entry_login.get().strip()
+        if not master_password:
+            self.error_label.configure(text="Yêu cầu đầu vào: Xin hãy điền Mật Khẩu Khóa Chính.")
+            return
+            
+        saved_signature = get_config("signature")
+        hashed_input = SecurityManager.hash_data(master_password)
         
+        # So sánh hàm băm tiêu chuẩn để mở khóa
+        if hashed_input != saved_signature:
+            self.error_label.configure(text="Lỗi Ủy Quyền: Mật khẩu chính (Master Pass) không khớp CSDL.")
+            return
+            
+        # Nạp lại Khóa ngầm từ thuật toán PBKDF2
+        saved_salt_b64 = get_config("salt")
+        salt_bytes = base64.b64decode(saved_salt_b64)
+        self.aes_key = SecurityManager.derive_key(master_password, salt_bytes)
+        
+        self.load_vault_datastore()
+
+    def load_vault_datastore(self):
+        self.error_label.configure(text="")
         self.vault_data.clear()
-        for entry in self.config_data.get("entries", []):
+        
+        db_entries = get_all_entries()
+        for entry in db_entries:
             decrypted_json = SecurityManager.decrypt_data(
                 self.aes_key, entry["iv"], entry["ciphertext"]
             )
@@ -239,8 +277,9 @@ class AuraVaultApp(ctk.CTk):
             return
         
         if self.editing_id:
+            # Sửa thông tin = Xoá dòng cũ và chèn dòng mới (Bản chất AES không thể cập nhật văn bản tĩnh)
             self.vault_data = [x for x in self.vault_data if x["original_id"] != self.editing_id]
-            self.config_data["entries"] = [x for x in self.config_data["entries"] if x["id"] != self.editing_id]
+            delete_entry(self.editing_id)
 
         new_obj = {
             "title": v_title,
@@ -253,18 +292,14 @@ class AuraVaultApp(ctk.CTk):
         
         raw_id = self.editing_id if self.editing_id else uuid.uuid4().hex
         
-        self.config_data["entries"].insert(0, {
-            "id": raw_id,
-            "iv": encrypted_res["iv"],
-            "ciphertext": encrypted_res["ciphertext"]
-        })
-        save_vault(self.config_data)
+        add_entry(raw_id, encrypted_res["iv"], encrypted_res["ciphertext"])
 
         new_obj["original_id"] = raw_id
+        
         self.vault_data.insert(0, new_obj)
 
         self.cancel_edit()
-        self.error_add.configure(text="Thông Báo: Thao tác biên dịch Bản mã và ghi tệp lưu trữ hoàn thành.", text_color="#22c55e")
+        self.error_add.configure(text="Thông Báo: Thao tác biên dịch Bản mã và ghi CSDL hoàn thành.", text_color="#22c55e")
         self.render_list()
 
     def toggle_password(self, item_id):
@@ -319,8 +354,7 @@ class AuraVaultApp(ctk.CTk):
 
     def delete_entry(self, entry_id):
         self.vault_data = [x for x in self.vault_data if x["original_id"] != entry_id]
-        self.config_data["entries"] = [x for x in self.config_data["entries"] if x["id"] != entry_id]
-        save_vault(self.config_data)
+        delete_entry(entry_id) # Trực tiếp can thiệp SQL
         self.render_list()
 
     def copy_to_clipboard(self, pw):
@@ -332,7 +366,9 @@ class AuraVaultApp(ctk.CTk):
         self.aes_key = None
         self.vault_data.clear()
         self.pass_visible_state.clear()
-        self.show_login_otp_frame()
+        self.pass_labels.clear()
+        self.toggle_btns.clear()
+        self.show_login_frame()
 
 if __name__ == "__main__":
     app = AuraVaultApp()
