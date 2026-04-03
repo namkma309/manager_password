@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mật khẩu người dùng (Bắt buộc ẩn)
+vault_data.json
+*.json
+
+# File logs
+otp_debug.log
+*.log
+
+# Pyinstaller (nếu có build exe)
+build/
+dist/
+*.spec
