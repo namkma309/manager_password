@@ -6,6 +6,31 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 class SecurityManager:
+    # ---------------- HARDWARE BINDING METHODS ----------------
+    @staticmethod
+    def get_machine_id() -> str:
+        """Trích xuất UUID của phần cứng máy tính (Áp dụng Windows)."""
+        import subprocess
+        try:
+            # Lệnh wmic lấy uuid của bo mạch chủ
+            out = subprocess.check_output('wmic csproduct get uuid', shell=True).decode('utf-8')
+            uuid_str = out.split('\n')[1].strip()
+            if not uuid_str:
+                return "DEFAULT_MACHINE_ID_FAILSAFE"
+            return uuid_str
+        except Exception:
+            # Dự phòng cho trường hợp lỗi
+            return "DEFAULT_MACHINE_ID_FAILSAFE"
+
+    @staticmethod
+    def get_hardware_key() -> bytes:
+        """Sinh ra một khóa AES-256 từ mã UUID phần cứng cứng."""
+        machine_id = SecurityManager.get_machine_id()
+        # Dùng chuỗi machine_id băm thành 32 byte tĩnh (SHA-256 length is 32 bytes)
+        digest = hashes.Hash(hashes.SHA256())
+        digest.update(machine_id.encode('utf-8'))
+        return digest.finalize()
+
     # ---------------- OTP METHODS ----------------
     @staticmethod
     def generate_totp_secret() -> str:

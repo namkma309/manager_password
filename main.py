@@ -28,9 +28,9 @@ class AuraVaultApp(ctk.CTk):
         self.pass_labels = {}
         self.toggle_btns = {}
 
-        # Nếu chưa có cấu hình trên SQLite -> Setup. Nếu có -> form Đăng nhập Đa cổng.
-        saved_totp = get_config("totp_secret")
-        if not saved_totp:
+        # Trạng thái khởi tạo: Kiểm tra khóa Hardware AES thay vì TOTP phẳng
+        saved_aes_enc = get_config("app_aes_key_enc_machine")
+        if not saved_aes_enc:
             self.show_setup_master_frame()
         else:
             self.show_login_frame()
@@ -62,8 +62,7 @@ class AuraVaultApp(ctk.CTk):
             self.err_lbl_1.configure(text="Lỗi Giao Thức: Vui lòng cung cấp Mật khẩu chính trước khi tiếp tục.")
             return
 
-        # Tính toán thông số PBKDF2 dựa trên hàm băm SHA
-        self.temp_pass_signature = SecurityManager.hash_data(master_password)  # Băm đối chiếu
+        self.temp_pass_signature = SecurityManager.hash_data(master_password)
         self.temp_salt = SecurityManager.generate_salt()
         self.temp_aes_key = SecurityManager.derive_key(master_password, self.temp_salt)
         
@@ -110,15 +109,23 @@ class AuraVaultApp(ctk.CTk):
 
         self.aes_key = self.temp_aes_key
         
-        # SQL Insert cấu hình lõi
+        # --- BẢO MẬT PHẦN CỨNG (HARDWARE ID BINDING) ---
+        machine_key = SecurityManager.get_hardware_key()
+        
+        # 1. Bí mật hóa Lõi AES Key bằng Khóa Phần cứng (Anti-Theft bảo vệ file vật lý DB)
+        enc_aes_via_machine = SecurityManager.encrypt_data(machine_key, base64.b64encode(self.aes_key).decode('utf-8'))
+        
+        # 2. Bí mật hóa OTP Secret bằng AES Key thay vì phẳng (Chống cấp quyền sinh OTP)
+        enc_totp_via_aes = SecurityManager.encrypt_data(self.aes_key, self.temp_totp_secret)
+
         set_config("signature", self.temp_pass_signature) 
         set_config("salt", base64.b64encode(self.temp_salt).decode('utf-8'))
-        set_config("totp_secret", self.temp_totp_secret)
-        set_config("app_aes_key", base64.b64encode(self.aes_key).decode('utf-8'))
+        set_config("app_aes_key_enc_machine", json.dumps(enc_aes_via_machine))
+        set_config("totp_secret_enc_aes", json.dumps(enc_totp_via_aes))
 
         self.show_vault_frame()
 
-    # ========================== ĐĂNG NHẬP ĐA CỔNG (OTP & MASTER PASS) ==========================
+    # ========================== ĐĂNG NHẬP ĐA CỔNG ==========================
     def show_login_frame(self):
         for widget in self.winfo_children():
             widget.destroy()
@@ -127,19 +134,19 @@ class AuraVaultApp(ctk.CTk):
         frame.pack(fill="both", expand=True, padx=40, pady=50)
 
         ctk.CTkLabel(frame, text="Manager Password", font=("Outfit", 34, "bold"), text_color="#8b5cf6").pack(pady=(10, 5))
-        ctk.CTkLabel(frame, text="Yêu cầu xác thực bảo mật: Lựa chọn 1 trong 2 phương thức để mở Két", font=("Outfit", 14)).pack(pady=(0, 20))
+        ctk.CTkLabel(frame, text="Mô Hình Cài Đặt Chống Sao Chép Dữ Liệu (Anti-Theft Hardware)", font=("Outfit", 14), text_color="#34d399").pack(pady=(0, 20))
 
         self.login_tabs = ctk.CTkTabview(frame, width=320, height=220, corner_radius=12)
         self.login_tabs.pack(pady=10)
 
-        # Tab 1: OTP
+        # Tab 1
         self.login_tabs.add("Mã Smart OTP")
         self.otp_entry = ctk.CTkEntry(self.login_tabs.tab("Mã Smart OTP"), placeholder_text="Mã TOTP", width=220, height=45, corner_radius=8, font=("Outfit", 20, "bold"), justify="center")
         self.otp_entry.pack(pady=20)
         self.otp_entry.bind("<Return>", lambda event: self.handle_login_otp())
         ctk.CTkButton(self.login_tabs.tab("Mã Smart OTP"), text="Xác Thực OTP", width=220, height=40, corner_radius=8, fg_color="#f59e0b", font=("Outfit", 14, "bold"), command=self.handle_login_otp).pack()
 
-        # Tab 2: Master Password
+        # Tab 2
         self.login_tabs.add("Khóa Master Pass")
         self.pass_entry_login = ctk.CTkEntry(self.login_tabs.tab("Khóa Master Pass"), placeholder_text="Nhập Master Password", show="*", width=220, height=45, corner_radius=8)
         self.pass_entry_login.pack(pady=20)
@@ -151,13 +158,34 @@ class AuraVaultApp(ctk.CTk):
 
     def handle_login_otp(self):
         code = self.otp_entry.get().strip()
-        saved_secret = get_config("totp_secret")
-        
-        if not SecurityManager.verify_totp(saved_secret, code):
-            self.error_label.configure(text="Lỗi Giao Thức Ủy Quyền: Mã TOTP cung cấp không hợp lệ.")
+        machine_key = SecurityManager.get_hardware_key()
+
+        # Bước 1: Mở trói AES Key từ Phần cứng máy tính
+        try:
+            saved_aes_enc = json.loads(get_config("app_aes_key_enc_machine"))
+            decrypted_aes_str = SecurityManager.decrypt_data(
+                machine_key, saved_aes_enc["iv"], saved_aes_enc["ciphertext"]
+            )
+            if not decrypted_aes_str:
+                raise ValueError()
+            self.aes_key = base64.b64decode(decrypted_aes_str)
+        except Exception:
+            self.error_label.configure(text="HỆ THỐNG CẢNH BÁO: Phát hiện bản sao chép DB. Truy cập OTP bị khóa vì lệch Phần cứng.\nHãy dùng cổng Master Password!")
+            return
+
+        # Bước 2: Dùng AES Key mở trói luồng mã OTP
+        try:
+            saved_totp_enc = json.loads(get_config("totp_secret_enc_aes"))
+            saved_secret = SecurityManager.decrypt_data(
+                self.aes_key, saved_totp_enc["iv"], saved_totp_enc["ciphertext"]
+            )
+            if not SecurityManager.verify_totp(saved_secret, code):
+                self.error_label.configure(text="Lỗi Giao Thức Ủy Quyền: Mã TOTP cung cấp không hợp lệ.")
+                return
+        except Exception:
+            self.error_label.configure(text="LỖI HỆ THỐNG: Cấu trúc xác thực bị hỏng.")
             return
             
-        self.aes_key = base64.b64decode(get_config("app_aes_key"))
         self.load_vault_datastore()
 
     def handle_login_master(self):
@@ -169,16 +197,29 @@ class AuraVaultApp(ctk.CTk):
         saved_signature = get_config("signature")
         hashed_input = SecurityManager.hash_data(master_password)
         
-        # So sánh hàm băm tiêu chuẩn để mở khóa
         if hashed_input != saved_signature:
             self.error_label.configure(text="Lỗi Ủy Quyền: Mật khẩu chính (Master Pass) không khớp CSDL.")
             return
             
-        # Nạp lại Khóa ngầm từ thuật toán PBKDF2
+        # Nạp lại Khóa Lõi thủ công bằng Băm Học thuật
         saved_salt_b64 = get_config("salt")
         salt_bytes = base64.b64decode(saved_salt_b64)
         self.aes_key = SecurityManager.derive_key(master_password, salt_bytes)
         
+        # --- CƠ CHẾ CHỮA LÀNH (AUTO HEAL / RE-BINDING) ---
+        machine_key = SecurityManager.get_hardware_key()
+        try:
+            saved_aes_enc = json.loads(get_config("app_aes_key_enc_machine"))
+            chk_aes = SecurityManager.decrypt_data(machine_key, saved_aes_enc["iv"], saved_aes_enc["ciphertext"])
+            if not chk_aes:
+                raise ValueError()
+        except Exception:
+            # Phát hiện người dùng đã sang một Máy Tính Mới -> Đúc lại Khóa Máy Tính cho họ
+            new_enc_aes = SecurityManager.encrypt_data(machine_key, base64.b64encode(self.aes_key).decode('utf-8'))
+            set_config("app_aes_key_enc_machine", json.dumps(new_enc_aes))
+            self.error_label.configure(text="Thông báo: Đã điều chỉnh lại cấu hình Lõi cho Bo Mạch Chủ mới thành công!", text_color="#34d399")
+            # Tạm thời k load DB ngay để cho ng dùng thấy dòng chữ báo thiết lập Mạch mới hoàn tất. Cứ load luôn cũng đc
+            
         self.load_vault_datastore()
 
     def load_vault_datastore(self):
@@ -277,7 +318,6 @@ class AuraVaultApp(ctk.CTk):
             return
         
         if self.editing_id:
-            # Sửa thông tin = Xoá dòng cũ và chèn dòng mới (Bản chất AES không thể cập nhật văn bản tĩnh)
             self.vault_data = [x for x in self.vault_data if x["original_id"] != self.editing_id]
             delete_entry(self.editing_id)
 
